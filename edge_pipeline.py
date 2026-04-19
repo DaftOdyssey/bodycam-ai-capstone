@@ -23,6 +23,13 @@ import tensorflow as tf
 import tensorflow_hub as hub
 import zmq
 
+# Force TensorFlow to run on CPU only, freeing GPU resources for the slow brain (PyTorch)
+# and ensuring compatibility on systems without an NVIDIA card.
+try:
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
@@ -67,6 +74,10 @@ class EdgeConfig:
     # Set to None to auto-select the best default input device for the OS.
     audio_input_device: Optional[str] = None
     audio_min_rms_for_inference: float = 0.01
+
+    # Ambient noise gating
+    ambient_rms_window_seconds: float = 30.0
+    ambient_rms_spike_multiplier: float = 1.5
 
     # Triggering / label tuning
     debug_top_k: int = 5
@@ -130,6 +141,10 @@ class EdgePipeline:
         self.last_trigger_ts = 0.0
         self.consecutive_strong_detections = 0
         self.last_best_label = None
+
+        # Ambient noise tracking
+        ambient_maxlen = max(1, int(self.config.ambient_rms_window_seconds / self.config.audio_chunk_seconds))
+        self.recent_rms: Deque[float] = deque(maxlen=ambient_maxlen)
 
         logger.info("Loading YAMNet model from TensorFlow Hub...")
         self.yamnet_model = hub.load("https://tfhub.dev/google/yamnet/1")
@@ -588,6 +603,11 @@ class EdgePipeline:
                 continue
 
             rms = float(np.sqrt(np.mean(np.square(waveform))))
+
+            # Track ambient noise before gating
+            self.recent_rms.append(rms)
+            ambient_noise_floor = float(np.mean(self.recent_rms)) if self.recent_rms else 0.0
+
             if rms < self.config.audio_min_rms_for_inference:
                 # Reset consecutive count if it gets too quiet
                 self.consecutive_strong_detections = 0
@@ -601,10 +621,10 @@ class EdgePipeline:
                 continue
 
             mean_scores = tf.reduce_mean(scores, axis=0).numpy()
-            
+
             top_k = max(1, self.config.debug_top_k)
             top_indices = np.argsort(mean_scores)[-top_k:][::-1]
-            
+
             if not self.monitored_targets:
                 continue
 
@@ -615,9 +635,9 @@ class EdgePipeline:
             decision_text = "NO trigger"
             triggered = False
             best_score_str = f"{best_label}={best_score:.2f}"
-            
+
             top_summary_short = f"{self.yamnet_classes[top_indices[0]]}={float(mean_scores[top_indices[0]]):.2f}"
-            
+
             # Smart trigger strategy
             if best_score >= best_threshold:
                 if best_label == self.last_best_label:
@@ -626,12 +646,16 @@ class EdgePipeline:
                     self.consecutive_strong_detections = 1
                 self.last_best_label = best_label
 
-                # 2 consecutive OR (score 1.5x threshold + RMS double the gate)
+                # 2 consecutive OR (score 1.5x threshold + RMS spike above ambient)
                 is_consecutive = self.consecutive_strong_detections >= 2
-                is_strong = (best_score >= best_threshold * 1.5) and (rms >= self.config.audio_min_rms_for_inference * 2.0)
-                
+                rms_spike = max(
+                    self.config.audio_min_rms_for_inference * 2.0,
+                    ambient_noise_floor * self.config.ambient_rms_spike_multiplier
+                )
+                is_strong = (best_score >= best_threshold * 1.5) and (rms >= rms_spike)
+
                 in_cooldown = (chunk_ts - self.last_trigger_ts) < self.config.trigger_cooldown_seconds
-                
+
                 if self._incident_active():
                     decision_text = "ALREADY ACTIVE"
                 elif in_cooldown:
@@ -646,9 +670,12 @@ class EdgePipeline:
                 self.last_best_label = None
                 decision_text = "NO trigger"
 
-            # 🎤 Audio chunk | top: Yell=0.87 | monitored: Shout=0.41 (RMS=0.015) → NO trigger
-            logger.info("🎤 Audio chunk | top: %s | monitored: %s (RMS=%.4f) → %s", 
-                        top_summary_short, best_score_str, rms, decision_text)
+            # 🎤 Audio chunk | top: Yell=0.87 | monitored: Shout=0.41 (RMS=0.015, Ambient=0.010, SpikeReq=0.020) → NO trigger
+            logger.info("🎤 Audio chunk | top: %s | monitored: %s (RMS=%.4f, Ambient=%.4f, SpikeReq=%.4f) → %s",
+                        top_summary_short, best_score_str, rms, ambient_noise_floor,
+                        max(self.config.audio_min_rms_for_inference * 2.0,
+                            ambient_noise_floor * self.config.ambient_rms_spike_multiplier) if best_score >= best_threshold else 0.0,
+                        decision_text)
 
             if triggered:
                 self.last_trigger_ts = chunk_ts
@@ -656,7 +683,7 @@ class EdgePipeline:
                     f"{best_label} (confidence={best_score:.2f}, threshold={best_threshold:.2f}, ts={chunk_ts:.6f})"
                 )
                 self._start_incident(trigger_reason=trigger_reason, trigger_ts=chunk_ts)
-                
+
                 if self.config.demo_mode:
                     event_id = self._current_event_id() or "unknown"
                     print(f"\n🔥 INCIDENT TRIGGERED! {best_label} ({best_score:.2f}) | event_id={event_id}\n")
@@ -695,7 +722,7 @@ class EdgePipeline:
 
         def _open_cap() -> Optional[cv2.VideoCapture]:
             cap = cv2.VideoCapture(device_index, backend)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
             cap.set(cv2.CAP_PROP_FPS, self.config.fps)
@@ -965,12 +992,15 @@ if __name__ == "__main__":
     parser.add_argument("--cooldown", type=float, default=None, help="Cooldown between triggers in seconds")
     parser.add_argument("--rms-gate", type=float, default=None, help="Minimum RMS for inference")
     parser.add_argument("--thresholds", type=str, default=None, help="Comma separated Label=Threshold pairs")
-    parser.add_argument("--resolution", type=str, default="1080p", choices=["1080p", "720p"], help="Video resolution (1080p or 720p)")
-    
+    parser.add_argument("--ambient-window", type=float, default=None, help="Ambient noise window in seconds")
+    parser.add_argument("--ambient-spike", type=float, default=None, help="Ambient noise spike multiplier")
+    parser.add_argument("--resolution", type=str, default="1080p", choices=["1080p", "720p"],
+                        help="Video resolution (1080p or 720p)")
+
     args = parser.parse_args()
-    
+
     config = EdgeConfig()
-    
+
     # Environment variables fallback
     if os.environ.get("DEMO_MODE", "").lower() in ("1", "true", "yes"):
         config.demo_mode = True
@@ -980,6 +1010,10 @@ if __name__ == "__main__":
         config.trigger_cooldown_seconds = float(os.environ["TRIGGER_COOLDOWN"])
     if "RMS_GATE" in os.environ:
         config.audio_min_rms_for_inference = float(os.environ["RMS_GATE"])
+    if "AMBIENT_WINDOW" in os.environ:
+        config.ambient_rms_window_seconds = float(os.environ["AMBIENT_WINDOW"])
+    if "AMBIENT_SPIKE" in os.environ:
+        config.ambient_rms_spike_multiplier = float(os.environ["AMBIENT_SPIKE"])
     if "MONITORED_THRESHOLDS" in os.environ:
         for pair in os.environ["MONITORED_THRESHOLDS"].split(","):
             if "=" in pair:
@@ -995,12 +1029,16 @@ if __name__ == "__main__":
         config.trigger_cooldown_seconds = args.cooldown
     if args.rms_gate is not None:
         config.audio_min_rms_for_inference = args.rms_gate
+    if args.ambient_window is not None:
+        config.ambient_rms_window_seconds = args.ambient_window
+    if args.ambient_spike is not None:
+        config.ambient_rms_spike_multiplier = args.ambient_spike
     if args.thresholds is not None:
         for pair in args.thresholds.split(","):
             if "=" in pair:
                 label, val = pair.split("=")
                 config.monitored_label_thresholds[label.strip()] = float(val.strip())
-                
+
     if args.resolution == "720p":
         config.frame_width = 1280
         config.frame_height = 720
