@@ -332,8 +332,8 @@ class ModalityAnalyzer:
     ) -> dict[str, Any]:
         """
         Analyze the incident video using:
-        1. basic visual heuristics: motion, darkness, blur
-        2. optional X-CLIP semantic video-text scoring
+        1. Basic visual heuristics: motion, darkness, blur
+        2. Optional X-CLIP semantic video-text scoring
 
         The final video risk score is a fusion of both.
         """
