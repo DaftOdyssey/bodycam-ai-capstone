@@ -13,5 +13,5 @@ dependencies = [
     "tensorflow[and-cuda]==2.20.*",
     "tensorflow-hub>=0.16.1",
     "uvicorn>=0.41.0",
-
+    "psycopg2-binary>=2.9.11",
 ]
